@@ -151,6 +151,8 @@ def main():
     parser.add_argument("--max-lost", type=int, default=15)
     parser.add_argument("--target-fps", type=int, default=30,
                         help="Max FPS to process (skips frames if input is higher)")
+    parser.add_argument("--all-trails", action="store_true",
+                        help="Draw all detected trails, not just the best")
     parser.add_argument("--show", action="store_true")
     parser.add_argument("--debug", action="store_true")
     args = parser.parse_args()
@@ -196,11 +198,12 @@ def main():
     INIT_CONF = max(args.conf, 0.5)
 
     kf = None
-    all_trails = []          # all valid shot trajectories
+    all_trails = []          # list of (start_frame, end_frame, trail_points)
     current_trail = []
     real_detections = []     # only positions from actual YOLO hits
     launch_y = None
     moving_up = False        # set once ball is detected above launch point
+    moving_up_frame = None   # frame when upward motion first detected
 
     frame_idx = 0
     while True:
@@ -268,9 +271,10 @@ def main():
                 cx, cy = detection[0], detection[1]
                 kf.update([cx, cy])
                 current_trail.append((cx, cy))
-                real_detections.append((cx, cy))
-                if launch_y is not None and cy < launch_y - 20:
+                real_detections.append((cx, cy, frame_idx))
+                if not moving_up and launch_y is not None and cy < launch_y - 20:
                     moving_up = True
+                    moving_up_frame = frame_idx
             else:
                 kf.mark_missed()
                 px, py = kf.position
@@ -279,13 +283,21 @@ def main():
 
             if kf.missed >= args.max_lost or (moving_up and kf.missed >= 10):
                 if is_upward_trajectory(real_detections, launch_y):
-                    # Trim coasted (predicted-only) points from the end
-                    trim = min(kf.missed, len(current_trail) - 1)
-                    saved_trail = current_trail[:-trim] if trim > 0 else list(current_trail)
-                    all_trails.append(saved_trail)
+                    # Trim spurious tail: remove trailing points that
+                    # jump too far from the previous point
+                    trimmed = list(real_detections)
+                    while len(trimmed) > 2:
+                        dx = trimmed[-1][0] - trimmed[-2][0]
+                        dy = trimmed[-1][1] - trimmed[-2][1]
+                        dist = np.sqrt(dx**2 + dy**2)
+                        if dist > 50:
+                            trimmed.pop()
+                        else:
+                            break
+                    start_f = moving_up_frame if moving_up_frame else frame_idx
+                    all_trails.append((start_f, frame_idx, trimmed))
                     print(f"  Frame {frame_idx}: Shot captured! "
-                          f"{len(saved_trail)} points "
-                          f"({len(real_detections)} real detections)")
+                          f"{len(real_detections)} real detections")
                 else:
                     print(f"  Frame {frame_idx}: Discarded trail "
                           f"({len(current_trail)} pts, "
@@ -295,6 +307,7 @@ def main():
                 real_detections = []
                 launch_y = None
                 moving_up = False
+                moving_up_frame = None
 
         # ── Draw ──
 
@@ -313,34 +326,60 @@ def main():
                 cv2.drawMarker(frame, (px, py), (0, 100, 255),
                                cv2.MARKER_CROSS, 15, 1)
 
-        # Detection circle (only once ball is moving up)
-        if detection is not None and moving_up:
-            cx, cy = detection[0], detection[1]
-            bw, bh = detection[2], detection[3]
-            r = max(bw, bh) // 2 + 6
-            cv2.circle(frame, (cx, cy), r, (0, 255, 0), 2)
-            cv2.circle(frame, (cx, cy), 2, (0, 255, 0), -1)
+        if frame_idx % 50 == 0:
+            st = "tracking" if kf else "searching"
+            print(f"  Frame {frame_idx}/{total} [{st}] "
+                  f"trail={len(current_trail)} shots={len(all_trails)}")
 
-        # Active trail while tracking (only once ball is moving up)
-        if moving_up and len(current_trail) > 1 and kf is not None:
-            pts = current_trail
-            for i in range(1, len(pts)):
-                cv2.line(frame, pts[i-1], pts[i], (0, 0, 255), 4, cv2.LINE_AA)
+    # Check if there's a valid trail still being tracked at end of video
+    if real_detections and is_upward_trajectory(real_detections, launch_y):
+        start_f = moving_up_frame if moving_up_frame else frame_idx
+        all_trails.append((start_f, frame_idx, list(real_detections)))
 
-        # All captured trajectories
-        for trail in all_trails:
-            for i in range(1, len(trail)):
-                cv2.line(frame, trail[i-1], trail[i],
-                         (0, 0, 255), 4, cv2.LINE_AA)
+    cap.release()
 
-        if args.debug:
-            st = "TRACKING" if kf else "SEARCHING"
-            extra = ""
-            if kf:
-                extra = f" spd={kf.speed:.0f} miss={kf.missed}"
-            info = f"f={frame_idx} {st}{extra} shots={len(all_trails)}"
-            cv2.putText(frame, info, (10, 25),
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1)
+    # Select trails to draw
+    if all_trails:
+        if args.all_trails:
+            draw_trails = all_trails
+            print(f"\nDrawing all {len(all_trails)} trail(s)")
+        else:
+            draw_trails = [max(all_trails, key=lambda t: len(t[2]))]
+            print(f"\nBest shot: {len(draw_trails[0][2])} points "
+                  f"(frames {draw_trails[0][0]}–{draw_trails[0][1]}, "
+                  f"from {len(all_trails)} candidate(s))")
+        for i, (s, e, t) in enumerate(all_trails):
+            print(f"  Trail {i+1}: {len(t)} points (frames {s}–{e})")
+    else:
+        draw_trails = []
+        print("\nNo valid upward trajectories found.")
+
+    # ── Second pass: write output with trails at the right time ──
+    print("Writing output video...")
+    cap2 = cv2.VideoCapture(str(video_path))
+    out = cv2.VideoWriter(args.output, fourcc, out_fps, (w, h))
+
+    frame_idx = 0
+    while True:
+        ret, frame = cap2.read()
+        if not ret:
+            break
+        frame_idx += 1
+
+        if frame_skip > 1 and (frame_idx % frame_skip) != 0:
+            continue
+
+        overlay = frame.copy()
+        drew = False
+        for _, _, trail in draw_trails:
+            pts = [(x, y) for x, y, f in trail if f <= frame_idx]
+            if len(pts) > 1:
+                for i in range(1, len(pts)):
+                    cv2.line(overlay, pts[i-1], pts[i],
+                             (0, 0, 255), 30, cv2.LINE_AA)
+                drew = True
+        if drew:
+            cv2.addWeighted(overlay, 0.4, frame, 0.6, 0, frame)
 
         out.write(frame)
 
@@ -349,26 +388,10 @@ def main():
             if cv2.waitKey(1) & 0xFF == ord("q"):
                 break
 
-        if frame_idx % 50 == 0:
-            st = "tracking" if kf else "searching"
-            print(f"  Frame {frame_idx}/{total} [{st}] "
-                  f"trail={len(current_trail)} shots={len(all_trails)}")
-
-    # Check if there's a valid trail still being tracked at end of video
-    if current_trail and is_upward_trajectory(real_detections, launch_y):
-        all_trails.append(list(current_trail))
-
-    cap.release()
+    cap2.release()
     out.release()
     cv2.destroyAllWindows()
-
-    print(f"\nDone! Output: {args.output}")
-    if all_trails:
-        print(f"Captured {len(all_trails)} shot(s)")
-        for i, trail in enumerate(all_trails):
-            print(f"  Shot {i+1}: {len(trail)} points")
-    else:
-        print("No valid upward trajectories found.")
+    print(f"Done! Output: {args.output}")
 
 
 if __name__ == "__main__":
