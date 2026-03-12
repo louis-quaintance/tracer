@@ -1,0 +1,25 @@
+# Python
+venv/
+__pycache__/
+*.pyc
+
+# YOLO
+dataset_yolo/
+runs/
+*.pt
+
+# AWS keys
+*.pem
+.aws_instance_id
+
+# Data
+data/
+
+# Output
+traced_output.mp4
+*.mp4
+videos/
+
+# Debug images
+tee_f*.png
+snapshot.png
