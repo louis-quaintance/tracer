@@ -8,7 +8,7 @@
 
 INPUT_DIR="videos"
 OUTPUT_DIR="output"
-MODEL="best_v2.pt"
+MODEL="best_new_v1.pt"
 CONF="0.4"
 EXTRA_ARGS="$@"
 

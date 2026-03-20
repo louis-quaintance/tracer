@@ -63,9 +63,9 @@ def convert_voc_image(xml_path, img_path, img_out, lbl_out, prefix=""):
     return True
 
 
-def convert_detection_data(split_name, ids, img_out, lbl_out):
+def convert_detection_data(data_root, split_name, ids, img_out, lbl_out, prefix="det_"):
     """Convert Detection dataset (flat structure)."""
-    det_root = PROJECT_DIR / "data" / "Detection"
+    det_root = data_root / "Detection"
     ann_dir = det_root / "Annotations"
     img_dir = det_root / "JPEGImages"
 
@@ -76,18 +76,18 @@ def convert_detection_data(split_name, ids, img_out, lbl_out):
             continue
         xml_path = ann_dir / f"{img_id}.xml"
         img_path = img_dir / f"{img_id}.jpg"
-        if convert_voc_image(xml_path, img_path, img_out, lbl_out, prefix="det_"):
+        if convert_voc_image(xml_path, img_path, img_out, lbl_out, prefix=prefix):
             converted += 1
 
     return converted
 
 
-def convert_tracking_data(split_name, img_out, lbl_out):
+def convert_tracking_data(data_root, split_name, img_out, lbl_out, prefix="trk_"):
     """
     Convert Tracking dataset (sequence folders for images,
     flat annotations).
     """
-    track_root = PROJECT_DIR / "data" / "Tracking"
+    track_root = data_root / "Tracking"
     ann_dir = track_root / "Annotations"
     img_base = track_root / "JPEGImages"
 
@@ -107,35 +107,66 @@ def convert_tracking_data(split_name, img_out, lbl_out):
         img_path = img_map.get(stem)
         if img_path is None:
             continue
-        if convert_voc_image(xml_file, img_path, img_out, lbl_out, prefix="trk_"):
+        if convert_voc_image(xml_file, img_path, img_out, lbl_out, prefix=prefix):
+            converted += 1
+
+    return converted
+
+
+def convert_custom_data(img_out, lbl_out):
+    """
+    Convert custom annotated frames from frames/ directory.
+    Expects JPG images with matching XML annotations (PascalVOC from labelImg).
+    """
+    frames_dir = PROJECT_DIR / "frames"
+    if not frames_dir.exists():
+        return 0
+
+    converted = 0
+    for img_path in sorted(frames_dir.glob("*.jpg")):
+        xml_path = frames_dir / f"{img_path.stem}.xml"
+        if convert_voc_image(xml_path, img_path, img_out, lbl_out, prefix="custom_"):
             converted += 1
 
     return converted
 
 
 def convert_all():
-    """Convert both Detection and Tracking datasets."""
+    """Convert Detection, Tracking, custom, and new_img_data datasets."""
     print("Converting VOC annotations to YOLO format...")
 
-    det_root = PROJECT_DIR / "data" / "Detection"
-    sets_dir = det_root / "ImageSets" / "Main"
+    data_roots = [
+        (PROJECT_DIR / "data", "det_", "trk_"),
+        (PROJECT_DIR / "new_img_data", "new_det_", "new_trk_"),
+    ]
 
-    train_ids = (sets_dir / "train.txt").read_text().strip().split("\n")
-    test_ids = (sets_dir / "test.txt").read_text().strip().split("\n")
-
-    for split_name, ids in [("train", train_ids), ("val", test_ids)]:
+    for split_name in ["train", "val"]:
         img_out = YOLO_DATASET / "images" / split_name
         lbl_out = YOLO_DATASET / "labels" / split_name
         img_out.mkdir(parents=True, exist_ok=True)
         lbl_out.mkdir(parents=True, exist_ok=True)
 
-        det_count = convert_detection_data(split_name, ids, img_out, lbl_out)
-        print(f"  {split_name} Detection: {det_count} images")
+        for data_root, det_prefix, trk_prefix in data_roots:
+            if not data_root.exists():
+                continue
+            label = data_root.name
 
-        # Add tracking data to train set only (it's all one set)
+            sets_dir = data_root / "Detection" / "ImageSets" / "Main"
+            split_file = sets_dir / ("train.txt" if split_name == "train" else "test.txt")
+            if split_file.exists():
+                ids = split_file.read_text().strip().split("\n")
+                det_count = convert_detection_data(data_root, split_name, ids, img_out, lbl_out, prefix=det_prefix)
+                print(f"  {split_name} {label}/Detection: {det_count} images")
+
+            if split_name == "train":
+                trk_dir = data_root / "Tracking"
+                if trk_dir.exists():
+                    trk_count = convert_tracking_data(data_root, split_name, img_out, lbl_out, prefix=trk_prefix)
+                    print(f"  {split_name} {label}/Tracking: {trk_count} images")
+
         if split_name == "train":
-            trk_count = convert_tracking_data(split_name, img_out, lbl_out)
-            print(f"  {split_name} Tracking: {trk_count} images")
+            custom_count = convert_custom_data(img_out, lbl_out)
+            print(f"  {split_name} Custom: {custom_count} images")
 
     yaml_path = YOLO_DATASET / "golfball.yaml"
     yaml_path.write_text(
@@ -153,11 +184,11 @@ def convert_all():
 def main():
     parser = argparse.ArgumentParser(description="Train golf ball detector")
     parser.add_argument("--epochs", type=int, default=100)
-    parser.add_argument("--model", default="yolov8s.pt",
-                        help="Base model (default: yolov8s.pt — better for small objects)")
-    parser.add_argument("--imgsz", type=int, default=640,
-                        help="Image size (default: 640 — higher res for small ball)")
-    parser.add_argument("--batch", type=int, default=16)
+    parser.add_argument("--model", default="yolov8m.pt",
+                        help="Base model (default: yolov8m.pt — better for small objects)")
+    parser.add_argument("--imgsz", type=int, default=1280,
+                        help="Image size (default: 1280 — higher res for tiny ball)")
+    parser.add_argument("--batch", type=int, default=8)
     parser.add_argument("--skip-convert", action="store_true")
     args = parser.parse_args()
 
@@ -188,6 +219,14 @@ def main():
         scale=0.5,
         flipud=0.0,
         fliplr=0.5,
+        # Brightness/contrast — helps detect ball on light backgrounds
+        hsv_h=0.015,   # hue shift
+        hsv_s=0.5,     # saturation shift
+        hsv_v=0.5,     # brightness shift (key for light backgrounds)
+        # Extra augmentation for robustness
+        degrees=5.0,   # slight rotation
+        translate=0.1,  # slight shift
+        mixup=0.1,     # blend two images together
     )
 
     print("\n── Training complete! ──")

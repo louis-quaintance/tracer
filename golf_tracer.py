@@ -1,11 +1,21 @@
 """
 Golf ball tracker — YOLOv8 detection + Kalman filter tracking.
 
-Initial search is restricted to the bottom-centre of the frame
-(central 30% width, bottom 50% height). Once found, tracks upward only.
+What this version improves:
+- Uses last REAL detection for gating, not coasted Kalman points
+- Adds box geometry filtering (area / aspect ratio)
+- Uses distance gating around prediction
+- Uses frame-skip-aware Kalman dt
+- Smooths final trail before drawing
+- Filters jumpy trail points
+- Makes search zone configurable
+- Uses more realistic Kalman measurement noise for tiny object detection
 
 Usage:
     python golf_tracer.py <video_path> --model best.pt [--show] [--debug]
+
+Example:
+    python golf_tracer.py input.mp4 --model best.pt --output traced.mp4 --show --debug
 """
 
 import argparse
@@ -18,16 +28,33 @@ from ultralytics import YOLO
 
 
 class BallKalmanFilter:
-    def __init__(self, x, y):
+    def __init__(self, x, y, dt=1.0):
+        self.dt = float(dt)
         self.xhat = np.array([x, y, 0.0, 0.0], dtype=float)
-        self.P = np.eye(4) * 100.0
+
+        # State covariance
+        self.P = np.eye(4) * 50.0
+
+        # State transition
         self.F = np.array([
-            [1, 0, 1, 0], [0, 1, 0, 1],
-            [0, 0, 1, 0], [0, 0, 0, 1],
+            [1, 0, self.dt, 0],
+            [0, 1, 0, self.dt],
+            [0, 0, 1, 0],
+            [0, 0, 0, 1],
         ], dtype=float)
-        self.H = np.array([[1, 0, 0, 0], [0, 1, 0, 0]], dtype=float)
-        self.Q = np.eye(4) * 5.0
-        self.R = np.eye(2) * 0.5
+
+        # Measurement model
+        self.H = np.array([
+            [1, 0, 0, 0],
+            [0, 1, 0, 0],
+        ], dtype=float)
+
+        # Process noise: allow velocity to change more than position
+        self.Q = np.diag([2.0, 2.0, 8.0, 8.0])
+
+        # Measurement noise: YOLO box center on a tiny blurred ball is noisy
+        self.R = np.diag([3.0, 3.0])
+
         self.age = 0
         self.missed = 0
 
@@ -50,22 +77,166 @@ class BallKalmanFilter:
 
     @property
     def position(self):
-        return int(self.xhat[0]), int(self.xhat[1])
+        return int(round(self.xhat[0])), int(round(self.xhat[1]))
 
     @property
     def speed(self):
-        return np.sqrt(self.xhat[2] ** 2 + self.xhat[3] ** 2)
+        return float(np.hypot(self.xhat[2], self.xhat[3]))
+
+
+def smooth_trail(points, window=5):
+    """
+    Smooth list of (x, y, frame_idx) using moving average on x/y only.
+    """
+    if len(points) < 3 or window < 2:
+        return points
+
+    arr = np.array(points, dtype=float)
+    smoothed = []
+    half = window // 2
+
+    for i in range(len(arr)):
+        a = max(0, i - half)
+        b = min(len(arr), i + half + 1)
+        mean_xy = arr[a:b, :2].mean(axis=0)
+        smoothed.append((int(round(mean_xy[0])),
+                         int(round(mean_xy[1])),
+                         int(arr[i, 2])))
+    return smoothed
+
+
+def filter_trail_points(points, max_step=60):
+    """
+    Remove jumpy detections from a trail.
+    Input: [(x, y, frame_idx), ...]
+    """
+    if len(points) < 2:
+        return points
+
+    filtered = [points[0]]
+    for p in points[1:]:
+        x1, y1, _ = filtered[-1]
+        x2, y2, _ = p
+        if np.hypot(x2 - x1, y2 - y1) <= max_step:
+            filtered.append(p)
+    return filtered
+
+
+def is_upward_trajectory(real_detections, launch_y, min_real=4, min_rise=80,
+                         upward_ratio=0.65):
+    """
+    Only counts real YOLO detections (not Kalman coasted positions).
+    Requires:
+      - At least min_real actual detections
+      - Ball moved upward by at least min_rise px
+      - Detections are spread out vertically
+      - Majority of steps move upward
+    """
+    if len(real_detections) < min_real or launch_y is None:
+        return False
+
+    ys = [p[1] for p in real_detections]
+    rise = launch_y - min(ys)
+    if rise < min_rise:
+        return False
+
+    y_spread = max(ys) - min(ys)
+    if y_spread < min_rise * 0.5:
+        return False
+
+    upward_steps = 0
+    total_steps = 0
+    for i in range(1, len(real_detections)):
+        dy = real_detections[i][1] - real_detections[i - 1][1]
+        total_steps += 1
+        if dy < 0:
+            upward_steps += 1
+
+    if total_steps == 0:
+        return False
+
+    return (upward_steps / total_steps) >= upward_ratio
+
+
+def select_best_detection(results, offset_x, offset_y, pred_x=None, pred_y=None,
+                          last_real_pos=None, launch_pos=None,
+                          full_w=None,
+                          min_area=4, max_area=400,
+                          min_ar=0.5, max_ar=1.8,
+                          max_dist=None,
+                          allow_downward_px=20,
+                          max_launch_dx_ratio=0.35):
+    """
+    Pick best detection from a YOLO result set using ball-specific geometry and motion gating.
+    Returns: (cx, cy, bw, bh, conf) or None
+    """
+    best = None
+    best_score = -1e9
+
+    for result in results:
+        boxes = result.boxes
+        for i in range(len(boxes)):
+            c = float(boxes.conf[i])
+            bx1, by1, bx2, by2 = map(int, boxes.xyxy[i])
+
+            bw = bx2 - bx1
+            bh = by2 - by1
+            if bw <= 0 or bh <= 0:
+                continue
+
+            area = bw * bh
+            if area < min_area or area > max_area:
+                continue
+
+            ar = bw / bh
+            if ar < min_ar or ar > max_ar:
+                continue
+
+            cx = (bx1 + bx2) // 2 + offset_x
+            cy = (by1 + by2) // 2 + offset_y
+
+            # Gate by distance to prediction
+            dist = 0.0
+            if pred_x is not None and pred_y is not None:
+                dist = float(np.hypot(cx - pred_x, cy - pred_y))
+                if max_dist is not None and dist > max_dist:
+                    continue
+
+            # Do not allow large downward moves once tracking
+            if last_real_pos is not None:
+                if cy > last_real_pos[1] + allow_downward_px:
+                    continue
+
+            # Ball should not suddenly jump far sideways from launch line
+            if launch_pos is not None and full_w is not None:
+                if abs(cx - launch_pos[0]) > full_w * max_launch_dx_ratio:
+                    continue
+
+            # Score = confidence + closeness + slight preference for square-ish boxes
+            score = 2.0 * c
+            score -= 0.015 * dist
+            score -= 0.002 * abs(bw - bh)
+
+            if last_real_pos is not None and cy < last_real_pos[1]:
+                score += 0.15  # slight upward preference
+
+            if score > best_score:
+                best_score = score
+                best = (cx, cy, bw, bh, c)
+
+    return best
 
 
 def detect_in_region(model, frame, cx, cy, crop_size, conf, full_w, full_h,
-                     last_pos=None, launch_pos=None):
+                     pred_x=None, pred_y=None,
+                     last_real_pos=None, launch_pos=None):
     """
-    Crop around (cx, cy), run YOLO, return best detection.
-    When tracking, rejects detections below last position or too
-    far horizontally from launch.
+    Crop around predicted point, run YOLO, return best detection.
     """
     half = crop_size // 2
-    if last_pos is not None:
+
+    if last_real_pos is not None:
+        # Bias crop upward while tracking
         x1 = max(0, cx - half)
         y1 = max(0, cy - int(half * 1.2))
         x2 = min(full_w, cx + half)
@@ -82,63 +253,26 @@ def detect_in_region(model, frame, cx, cy, crop_size, conf, full_w, full_h,
 
     results = model(crop, conf=conf, verbose=False)
 
-    best = None
-    best_score = 0
-
-    for result in results:
-        boxes = result.boxes
-        for i in range(len(boxes)):
-            c = float(boxes.conf[i])
-            bx1, by1, bx2, by2 = map(int, boxes.xyxy[i])
-            det_cx = (bx1 + bx2) // 2 + x1
-            det_cy = (by1 + by2) // 2 + y1
-            det_w = bx2 - bx1
-            det_h = by2 - by1
-
-            score = c
-
-            if last_pos is not None:
-                if det_cy > last_pos[1] + 30:
-                    continue
-                dist = np.sqrt((det_cx - cx) ** 2 + (det_cy - cy) ** 2)
-                score += max(0, 1.0 - dist / half) * 0.5
-
-            if launch_pos is not None:
-                if abs(det_cx - launch_pos[0]) > full_w * 0.4:
-                    continue
-
-            if score > best_score:
-                best_score = score
-                best = (det_cx, det_cy, det_w, det_h, c)
+    max_dist = crop_size * 0.6
+    best = select_best_detection(
+        results,
+        offset_x=x1,
+        offset_y=y1,
+        pred_x=pred_x,
+        pred_y=pred_y,
+        last_real_pos=last_real_pos,
+        launch_pos=launch_pos,
+        full_w=full_w,
+        min_area=4,
+        max_area=400,
+        min_ar=0.5,
+        max_ar=1.8,
+        max_dist=max_dist,
+        allow_downward_px=20,
+        max_launch_dx_ratio=0.35,
+    )
 
     return best, (x1, y1, x2, y2)
-
-
-def is_upward_trajectory(real_detections, launch_y, min_real=3, min_rise=80):
-    """
-    Only counts real YOLO detections (not Kalman coasted positions).
-    Requires:
-      - At least min_real actual detections
-      - Ball moved upward by at least min_rise px
-      - Detections are spread out (not all clustered on the tee)
-    """
-    if len(real_detections) < min_real or launch_y is None:
-        return False
-
-    ys = [p[1] for p in real_detections]
-    min_y = min(ys)
-    rise = launch_y - min_y
-
-    if rise < min_rise:
-        return False
-
-    # Check that detections are spread vertically — not all in the
-    # same spot (which would mean ball sitting on tee being re-detected)
-    y_spread = max(ys) - min(ys)
-    if y_spread < min_rise * 0.5:
-        return False
-
-    return True
 
 
 def main():
@@ -155,6 +289,13 @@ def main():
                         help="Draw all detected trails, not just the best")
     parser.add_argument("--show", action="store_true")
     parser.add_argument("--debug", action="store_true")
+
+    # Search zone config
+    parser.add_argument("--search-x-min", type=float, default=0.35)
+    parser.add_argument("--search-x-max", type=float, default=0.65)
+    parser.add_argument("--search-y-min", type=float, default=0.50)
+    parser.add_argument("--search-y-max", type=float, default=0.95)
+
     args = parser.parse_args()
 
     video_path = Path(args.video)
@@ -165,7 +306,6 @@ def main():
     model_path = Path(args.model)
     if not model_path.exists():
         print(f"Error: Model not found at {model_path}")
-        print("Train first: python train.py")
         sys.exit(1)
 
     print(f"Loading model: {model_path}")
@@ -178,32 +318,37 @@ def main():
     total = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
     print(f"Video: {w}x{h} @ {fps:.1f} fps, {total} frames")
 
-    # Skip frames if input FPS exceeds target
+    # Frame skipping
     frame_skip = max(1, int(round(fps / args.target_fps))) if fps > args.target_fps else 1
-    out_fps = fps / frame_skip
+    out_fps = fps / frame_skip if frame_skip > 0 else fps
     if frame_skip > 1:
         print(f"Input {fps:.0f}fps > target {args.target_fps}fps — "
               f"processing every {frame_skip} frame(s), output at {out_fps:.1f}fps")
 
     fourcc = cv2.VideoWriter_fourcc(*"mp4v")
-    out = cv2.VideoWriter(args.output, fourcc, out_fps, (w, h))
+    trail_thickness = max(4, int(min(w, h) * 0.008))
 
-    # ── Search zone: central 30% width, bottom 50% height ──
-    search_x1 = int(w * 0.35)
-    search_x2 = int(w * 0.65)
-    search_y1 = int(h * 0.50)
-    search_y2 = int(h * 0.95)
+    # Search zone
+    search_x1 = int(w * args.search_x_min)
+    search_x2 = int(w * args.search_x_max)
+    search_y1 = int(h * args.search_y_min)
+    search_y2 = int(h * args.search_y_max)
     print(f"Search zone: ({search_x1},{search_y1}) to ({search_x2},{search_y2})")
 
     INIT_CONF = max(args.conf, 0.5)
 
+    # Tracking state
     kf = None
-    all_trails = []          # list of (start_frame, end_frame, trail_points)
-    current_trail = []
-    real_detections = []     # only positions from actual YOLO hits
+    all_trails = []      # list of dicts: {start, end, raw, smooth}
+    current_trail = []   # debug only: includes coasted points
+    real_detections = [] # list of (x, y, frame_idx)
+
     launch_y = None
-    moving_up = False        # set once ball is detected above launch point
-    moving_up_frame = None   # frame when upward motion first detected
+    launch_pos = None
+    last_real_pos = None
+
+    moving_up = False
+    moving_up_frame = None
 
     frame_idx = 0
     while True:
@@ -212,7 +357,6 @@ def main():
             break
         frame_idx += 1
 
-        # Skip frames for high-FPS videos
         if frame_skip > 1 and (frame_idx % frame_skip) != 0:
             continue
 
@@ -220,37 +364,42 @@ def main():
         crop_rect = None
 
         if kf is None:
-            # ── Search only in the restricted zone ──
+            # Initial search only in tee area
             search_crop = frame[search_y1:search_y2, search_x1:search_x2]
             results = model(search_crop, conf=INIT_CONF, verbose=False)
 
-            best_conf = 0
-            for result in results:
-                boxes = result.boxes
-                for i in range(len(boxes)):
-                    c = float(boxes.conf[i])
-                    if c > best_conf:
-                        bx1, by1, bx2, by2 = map(int, boxes.xyxy[i])
-                        cx = (bx1 + bx2) // 2 + search_x1
-                        cy = (by1 + by2) // 2 + search_y1
-                        bw = bx2 - bx1
-                        bh = by2 - by1
-                        best_conf = c
-                        detection = (cx, cy, bw, bh, c)
+            detection = select_best_detection(
+                results,
+                offset_x=search_x1,
+                offset_y=search_y1,
+                pred_x=None,
+                pred_y=None,
+                last_real_pos=None,
+                launch_pos=None,
+                full_w=w,
+                min_area=4,
+                max_area=500,
+                min_ar=0.5,
+                max_ar=1.8,
+                max_dist=None,
+            )
 
             if detection is not None:
                 cx, cy = detection[0], detection[1]
-                kf = BallKalmanFilter(cx, cy)
+                kf = BallKalmanFilter(cx, cy, dt=frame_skip)
                 current_trail = [(cx, cy)]
+                real_detections = [(cx, cy, frame_idx)]
                 launch_y = cy
-                print(f"  Frame {frame_idx}: Ball found at ({cx},{cy}) "
-                      f"conf={detection[4]:.2f}")
+                launch_pos = (cx, cy)
+                last_real_pos = (cx, cy)
+
+                print(f"  Frame {frame_idx}: Ball found at ({cx},{cy}) conf={detection[4]:.2f}")
 
         else:
-            # ── Track: predict, crop, detect, update ──
             predicted = kf.predict()
-            pred_x, pred_y = int(predicted[0]), int(predicted[1])
+            pred_x, pred_y = int(round(predicted[0])), int(round(predicted[1]))
 
+            # Dynamic crop
             speed = kf.speed
             crop = args.crop_size
             if speed > 30:
@@ -259,19 +408,32 @@ def main():
                 crop = int(crop * (1 + kf.missed * 0.2))
             crop = min(crop, max(w, h))
 
-            lp = current_trail[-1] if current_trail else None
-            lnch = current_trail[0] if current_trail else None
-            # Lower confidence when tracking
-            track_conf = args.conf * 0.4  # e.g. 0.25 -> 0.10
+            # Lower conf during tracking, but clamp to safer range
+            track_conf = max(0.08, min(args.conf * 0.4, 0.18))
+
             detection, crop_rect = detect_in_region(
-                model, frame, pred_x, pred_y, crop, track_conf, w, h,
-                last_pos=lp, launch_pos=lnch)
+                model=model,
+                frame=frame,
+                cx=pred_x,
+                cy=pred_y,
+                crop_size=crop,
+                conf=track_conf,
+                full_w=w,
+                full_h=h,
+                pred_x=pred_x,
+                pred_y=pred_y,
+                last_real_pos=last_real_pos,
+                launch_pos=launch_pos,
+            )
 
             if detection is not None:
                 cx, cy = detection[0], detection[1]
                 kf.update([cx, cy])
+
                 current_trail.append((cx, cy))
                 real_detections.append((cx, cy, frame_idx))
+                last_real_pos = (cx, cy)
+
                 if not moving_up and launch_y is not None and cy < launch_y - 20:
                     moving_up = True
                     moving_up_frame = frame_idx
@@ -281,80 +443,96 @@ def main():
                 if 0 <= px < w and 0 <= py < h:
                     current_trail.append((px, py))
 
+            # End current candidate trail
             if kf.missed >= args.max_lost or (moving_up and kf.missed >= 10):
                 if is_upward_trajectory(real_detections, launch_y):
-                    # Trim spurious tail: remove trailing points that
-                    # jump too far from the previous point
-                    trimmed = list(real_detections)
-                    while len(trimmed) > 2:
-                        dx = trimmed[-1][0] - trimmed[-2][0]
-                        dy = trimmed[-1][1] - trimmed[-2][1]
-                        dist = np.sqrt(dx**2 + dy**2)
-                        if dist > 50:
-                            trimmed.pop()
-                        else:
-                            break
-                    start_f = moving_up_frame if moving_up_frame else frame_idx
-                    all_trails.append((start_f, frame_idx, trimmed))
+                    filtered = filter_trail_points(real_detections, max_step=60)
+                    smoothed = smooth_trail(filtered, window=5)
+
+                    start_f = moving_up_frame if moving_up_frame is not None else (
+                        real_detections[0][2] if real_detections else frame_idx
+                    )
+
+                    all_trails.append({
+                        "start": start_f,
+                        "end": frame_idx,
+                        "raw": list(real_detections),
+                        "smooth": smoothed,
+                    })
                     print(f"  Frame {frame_idx}: Shot captured! "
                           f"{len(real_detections)} real detections")
                 else:
                     print(f"  Frame {frame_idx}: Discarded trail "
-                          f"({len(current_trail)} pts, "
-                          f"{len(real_detections)} real) — not upward")
+                          f"({len(current_trail)} pts, {len(real_detections)} real) — not upward")
+
+                # Reset tracker
                 kf = None
                 current_trail = []
                 real_detections = []
                 launch_y = None
+                launch_pos = None
+                last_real_pos = None
                 moving_up = False
                 moving_up_frame = None
 
-        # ── Draw ──
-
+        # Debug drawing
         if args.debug:
             if kf is None:
                 cv2.rectangle(frame, (search_x1, search_y1),
                               (search_x2, search_y2), (255, 0, 0), 2)
                 cv2.putText(frame, "SEARCH ZONE", (search_x1, search_y1 - 8),
                             cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 0, 0), 1)
+
             if crop_rect is not None:
                 rx1, ry1, rx2, ry2 = crop_rect
-                cv2.rectangle(frame, (rx1, ry1), (rx2, ry2),
-                              (255, 100, 0), 1)
+                cv2.rectangle(frame, (rx1, ry1), (rx2, ry2), (255, 100, 0), 1)
+
             if kf is not None:
                 px, py = kf.position
                 cv2.drawMarker(frame, (px, py), (0, 100, 255),
                                cv2.MARKER_CROSS, 15, 1)
 
+                if last_real_pos is not None:
+                    cv2.circle(frame, last_real_pos, 4, (0, 255, 0), -1)
+
         if frame_idx % 50 == 0:
-            st = "tracking" if kf else "searching"
-            print(f"  Frame {frame_idx}/{total} [{st}] "
+            state = "tracking" if kf else "searching"
+            print(f"  Frame {frame_idx}/{total} [{state}] "
                   f"trail={len(current_trail)} shots={len(all_trails)}")
 
-    # Check if there's a valid trail still being tracked at end of video
+    # Save final trail if video ends mid-track
     if real_detections and is_upward_trajectory(real_detections, launch_y):
-        start_f = moving_up_frame if moving_up_frame else frame_idx
-        all_trails.append((start_f, frame_idx, list(real_detections)))
+        filtered = filter_trail_points(real_detections, max_step=60)
+        smoothed = smooth_trail(filtered, window=5)
+        start_f = moving_up_frame if moving_up_frame is not None else real_detections[0][2]
+        all_trails.append({
+            "start": start_f,
+            "end": frame_idx,
+            "raw": list(real_detections),
+            "smooth": smoothed,
+        })
 
     cap.release()
 
-    # Select trails to draw
+    # Select which trails to draw
     if all_trails:
         if args.all_trails:
             draw_trails = all_trails
             print(f"\nDrawing all {len(all_trails)} trail(s)")
         else:
-            draw_trails = [max(all_trails, key=lambda t: len(t[2]))]
-            print(f"\nBest shot: {len(draw_trails[0][2])} points "
-                  f"(frames {draw_trails[0][0]}–{draw_trails[0][1]}, "
+            draw_trails = [max(all_trails, key=lambda t: len(t["smooth"]))]
+            print(f"\nBest shot: {len(draw_trails[0]['smooth'])} points "
+                  f"(frames {draw_trails[0]['start']}–{draw_trails[0]['end']}, "
                   f"from {len(all_trails)} candidate(s))")
-        for i, (s, e, t) in enumerate(all_trails):
-            print(f"  Trail {i+1}: {len(t)} points (frames {s}–{e})")
+
+        for i, t in enumerate(all_trails):
+            print(f"  Trail {i+1}: {len(t['smooth'])} points "
+                  f"(frames {t['start']}–{t['end']})")
     else:
         draw_trails = []
         print("\nNo valid upward trajectories found.")
 
-    # ── Second pass: write output with trails at the right time ──
+    # Second pass: write output
     print("Writing output video...")
     cap2 = cv2.VideoCapture(str(video_path))
     out = cv2.VideoWriter(args.output, fourcc, out_fps, (w, h))
@@ -371,15 +549,19 @@ def main():
 
         overlay = frame.copy()
         drew = False
-        for _, _, trail in draw_trails:
+
+        for trail_info in draw_trails:
+            trail = trail_info["smooth"]
             pts = [(x, y) for x, y, f in trail if f <= frame_idx]
+
             if len(pts) > 1:
                 for i in range(1, len(pts)):
-                    cv2.line(overlay, pts[i-1], pts[i],
-                             (0, 0, 255), 30, cv2.LINE_AA)
+                    cv2.line(overlay, pts[i - 1], pts[i],
+                             (0, 0, 255), trail_thickness, cv2.LINE_AA)
                 drew = True
+
         if drew:
-            cv2.addWeighted(overlay, 0.4, frame, 0.6, 0, frame)
+            cv2.addWeighted(overlay, 0.55, frame, 0.45, 0, frame)
 
         out.write(frame)
 
