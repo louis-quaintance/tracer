@@ -120,138 +120,89 @@ def find_launch_sequence(detections, total_frames, min_points=4,
 
 def fit_trajectory_parametric(launch_points, fps, frame_w, frame_h):
     """
-    Fit x(t) and y(t) separately using frame number as the time parameter,
-    then extrapolate forward until the ball returns to ground level.
+    Build a trajectory from first detection to last, then project a
+    parabolic arc from the last detected point into the distance.
 
-    x(t): linear with perspective deceleration — ball moves into the
-           distance so apparent speed decreases.
-    y(t): quadratic — gravity pulls the ball back down.
-
-    The ball's velocity at the last detection dictates how far and high
-    the projected arc extends.
-
-    Returns a list of (x, y) image-coordinate points for the full arc.
+    The projection barely moves in x (golf shot goes away from camera,
+    not sideways). It arcs up, peaks, then comes back down to a landing
+    point that's higher in the image (further away in perspective).
     """
-    frames = np.array([p[0] for p in launch_points], dtype=np.float64)
-    xs = np.array([p[1] for p in launch_points], dtype=np.float64)
-    ys = np.array([p[2] for p in launch_points], dtype=np.float64)
+    pts = sorted(launch_points, key=lambda p: p[0])
+    frames = np.array([p[0] for p in pts], dtype=np.float64)
+    xs = np.array([p[1] for p in pts], dtype=np.float64)
+    ys = np.array([p[2] for p in pts], dtype=np.float64)
 
-    # Normalise time to start at 0
+    # --- Detected portion: line through all captured points ---
+    detected_line = [(int(x), int(y)) for x, y in zip(xs, ys)]
+
+    # --- Estimate velocity from last few detections ---
     t = frames - frames[0]
+    tail_n = min(4, len(t))
+    vy = np.polyfit(t[-tail_n:], ys[-tail_n:], 1)[0]  # neg = going up
 
-    # --- Fit x(t): linear velocity from detections ---
-    x_coeffs = np.polyfit(t, xs, 1)  # x(t) = vx*t + x0
-    vx = x_coeffs[0]  # pixels per frame in x
-    x0 = x_coeffs[1]
+    last_x = float(xs[-1])
+    last_y = float(ys[-1])
+    ground_y = float(ys[0])
+    rise_so_far = ground_y - last_y  # how far the ball has risen (px)
 
-    # --- Fit y(t): linear velocity from detections (rising phase only) ---
-    y_lin = np.polyfit(t, ys, 1)
-    vy = y_lin[0]   # negative in image coords = ball going up
-    y0 = y_lin[1]
+    print(f"  First detection: ({xs[0]:.0f}, {ys[0]:.0f})")
+    print(f"  Last detection:  ({last_x:.0f}, {last_y:.0f})")
+    print(f"  Rise so far: {rise_so_far:.0f}px, vy={vy:.1f} px/frame")
 
-    # Ground level = y of first detection (where the ball was hit from)
-    ground_y = ys[0]
+    # --- Projection: ballistic continuation from last detection ---
+    # Uses the SAME velocity (vy) at the join point so the line continues
+    # smoothly in the same direction, then gravity bends it into an arc.
 
-    # Total rise observed so far (in pixels)
-    rise_px = ground_y - ys[-1]  # positive = ball went up
+    # Also estimate vx from the last few detections
+    vx = np.polyfit(t[-tail_n:], xs[-tail_n:], 1)[0]
 
-    # --- Model a golf-shot-like arc ---
-    # A real golf shot: the ball rises steeply at first, reaches apex
-    # roughly 1/3 to 1/2 of the way through the flight, then descends
-    # on a longer, shallower path back to ground.
-    #
-    # We know the initial vertical velocity (vy, negative = up in image).
-    # Time to apex: t_apex where vy + g*t_apex = 0 => t_apex = -vy/g
-    # We want the apex to be high and the flight to be LONG.
-    #
-    # Estimate: the ball has been rising for t[-1] frames and is still
-    # going up strongly, so apex is well beyond what we've seen.
-    # Use the velocity to estimate time-to-apex as a multiple of what
-    # we've observed.
+    # Time to apex: vy + g*t = 0. vy is negative (upward), g is positive.
+    t_to_apex = max(8, abs(vy) * 3)
+    g = abs(vy) / t_to_apex
 
-    t_observed = t[-1] if t[-1] > 0 else 1
+    # Total flight time after last detection (descent a bit longer than rise)
+    t_total = t_to_apex * 2.5
 
-    # --- Model a golf-shot arc with perspective ---
-    # The ball rises steeply near the camera then travels far into the
-    # distance. In image coordinates:
-    #   - The apex is high up in the frame
-    #   - The descent converges toward the horizon (landing y is much
-    #     HIGHER in the image than launch y, because the landing spot
-    #     is far away in perspective)
-    #   - Apparent speed decreases as the ball gets further away
+    # Landing y: ball lands far away, so higher in image (perspective)
+    apex_y = last_y + vy * t_to_apex + 0.5 * g * t_to_apex**2
+    total_peak_height = ground_y - apex_y
+    landing_y = ground_y - total_peak_height * 0.4
 
-    # Apex at ~4x the observed rising time
-    t_apex = t_observed * 4
+    # --- Generate projection as a ballistic curve ---
+    # y(dt) = last_y + vy*dt + 0.5*g*dt^2
+    # This starts with exactly the same slope (vy) as the detected phase
+    n_pts = 400
+    dt = np.linspace(0, t_total, n_pts)
 
-    # Gravity to match: g = -vy / t_apex (vy is negative = upward)
-    g = -vy / t_apex
+    # Raw ballistic y
+    proj_ys = last_y + vy * dt + 0.5 * g * dt**2
 
-    # Total flight: ball takes longer to descend than rise (longer arc)
-    t_land = t_apex * 2.5
+    # After apex, blend descent toward landing_y (perspective compression)
+    apex_idx = int(np.argmin(proj_ys))
+    apex_y_actual = float(proj_ys[apex_idx])
+    for i in range(apex_idx, n_pts):
+        descent_t = (i - apex_idx) / max(n_pts - apex_idx, 1)
+        # Raw ballistic wants to go back to ground, but perspective
+        # means landing is higher up. Blend toward landing_y.
+        raw = proj_ys[i]
+        target = apex_y_actual + (landing_y - apex_y_actual) * (descent_t ** 2)
+        proj_ys[i] = target
 
-    # Ensure flight is substantially longer than what we observed
-    t_land = max(t_land, t_observed * 10)
+    # X: continue with the same vx, decelerating with perspective
+    perspective = 1.0 / (1.0 + 0.1 * dt)
+    proj_xs = last_x + vx * dt * perspective
 
-    print(f"  Velocity: vx={vx:.1f} vy={vy:.1f} px/frame")
-    print(f"  Estimated apex at t={t_apex:.0f}, landing at t={t_land:.0f} "
-          f"(observed {t_observed:.0f} frames)")
-
-    # --- Landing height (perspective) ---
-    # The ball lands far away, so in the image it lands much higher up
-    # than where it was hit. The landing y should be somewhere between
-    # the apex and the launch height — roughly 40-60% of the way up
-    # from launch to apex.
-    y_at_apex = y0 + vy * t_apex + 0.5 * g * t_apex**2
-    apex_rise = ground_y - y_at_apex  # how far above ground the apex is
-    # Landing point in image is well above ground (far away in perspective)
-    landing_y = ground_y - apex_rise * 0.55
-
-    # --- Generate the full arc ---
-    n_pts = 800
-    t_curve = np.linspace(0, t_land, n_pts)
-
-    # Perspective scale: things further in time are further in distance,
-    # so both x-movement and y-movement shrink. This factor goes from
-    # 1.0 (at launch) toward ~0 (at landing, far in distance).
-    # Use a smooth function that decelerates strongly toward the end.
-    perspective = 1.0 / (1.0 + 0.02 * t_curve)
-
-    # x(t): horizontal movement with strong perspective deceleration.
-    # Ball keeps moving in x but progressively slower — converging
-    # toward a distant point.
-    curve_xs = x0 + vx * t_curve * perspective
-
-    # y(t): parabolic arc in "world space", then compress the descent
-    # side with perspective so the ball lands high up in the image.
-    #
-    # Raw parabola (no perspective):
-    y_raw = y0 + vy * t_curve + 0.5 * g * t_curve**2
-    #
-    # But the descent side needs to land at landing_y, not ground_y.
-    # Blend: before apex, use raw parabola; after apex, interpolate
-    # between the raw parabola and the perspective-adjusted landing.
-    curve_ys = np.copy(y_raw)
-
-    t_apex_actual = -vy / g if g > 0 else t_apex
-    y_apex = float(y_raw[np.argmin(y_raw)])
-    for i, tt in enumerate(t_curve):
-        if tt > t_apex_actual:
-            # How far through the descent are we (0=apex, 1=landing)
-            descent_progress = (tt - t_apex_actual) / max(t_land - t_apex_actual, 1)
-            descent_progress = min(descent_progress, 1.0)
-
-            # Very high exponent so ball hangs near apex for most of
-            # the descent, only dropping in the final ~15%.
-            ease = descent_progress ** 17
-            curve_ys[i] = y_apex + (landing_y - y_apex) * ease
-
-    # Build trajectory, stop at frame bounds
-    trajectory = []
-    for cx, cy in zip(curve_xs, curve_ys):
+    # Build projected points
+    projected = []
+    for cx, cy in zip(proj_xs[1:], proj_ys[1:]):
         ix, iy = int(round(cx)), int(round(cy))
         if 0 <= ix < frame_w and 0 <= iy < frame_h:
-            trajectory.append((ix, iy))
+            projected.append((ix, iy))
 
+    trajectory = detected_line + projected
+    print(f"  Apex at y={apex_y:.0f}, landing at y={landing_y:.0f}")
+    print(f"  Trajectory: {len(detected_line)} detected + "
+          f"{len(projected)} projected points")
     return trajectory
 
 
@@ -280,38 +231,29 @@ def smooth_trace_line(detections):
     return cleaned
 
 
-def draw_line_on_frame(frame, points, thickness=5, color=(0, 0, 255)):
-    """Draw a smooth line through a list of (x, y) points."""
+def draw_line_on_frame(frame, points, thickness=20, alpha=0.4):
+    """Draw a thick semi-transparent red line through points."""
     if len(points) < 2:
         return frame
 
+    overlay = frame.copy()
     for i in range(len(points) - 1):
-        # Slight gradient: brighter at the start
-        t = i / max(len(points) - 1, 1)
-        r = int(255 - 60 * t)
-        col = (int(30 * t), int(20 * t), r)  # BGR
-        cv2.line(frame, points[i], points[i + 1], col, thickness, cv2.LINE_AA)
-
+        cv2.line(overlay, points[i], points[i + 1],
+                 (0, 0, 255), thickness, cv2.LINE_AA)
+    cv2.addWeighted(overlay, alpha, frame, 1 - alpha, 0, frame)
     return frame
 
 
-def draw_trajectory_on_frame(frame, trajectory_points, thickness=6):
-    """Draw a smooth gradient trajectory arc on the frame."""
+def draw_trajectory_on_frame(frame, trajectory_points, thickness=12, alpha=0.5):
+    """Draw a thick semi-transparent red trajectory arc."""
     if len(trajectory_points) < 2:
         return frame
 
-    n = len(trajectory_points)
-    for i in range(n - 1):
-        t = i / max(n - 1, 1)
-        r = int(255 - 80 * t)
-        g = int(30 * t)
-        b_val = int(30 * t)
-        color = (b_val, g, r)  # BGR
-
-        pt1 = trajectory_points[i]
-        pt2 = trajectory_points[i + 1]
-        cv2.line(frame, pt1, pt2, color, thickness, cv2.LINE_AA)
-
+    overlay = frame.copy()
+    for i in range(len(trajectory_points) - 1):
+        cv2.line(overlay, trajectory_points[i], trajectory_points[i + 1],
+                 (0, 0, 255), thickness, cv2.LINE_AA)
+    cv2.addWeighted(overlay, alpha, frame, 1 - alpha, 0, frame)
     return frame
 
 
@@ -325,7 +267,7 @@ def main():
     parser.add_argument("--show", action="store_true")
     parser.add_argument("--min-points", type=int, default=4,
                         help="Minimum detections needed for a launch sequence")
-    parser.add_argument("--thickness", type=int, default=6,
+    parser.add_argument("--thickness", type=int, default=17,
                         help="Line thickness for the trajectory")
     args = parser.parse_args()
 
