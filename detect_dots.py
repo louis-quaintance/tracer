@@ -14,38 +14,55 @@ import cv2
 import numpy as np
 from ultralytics import YOLO
 
-def add_end_loop(points, loop_radius=10, num_loop_points=12):
+def add_end_loop(points, num_loop_points=50):
     """
-    Add a small curved hook/loop to the end of the trajectory
-    to mimic a stylised golf-shot tracer finish.
+    Extend the line by 20% of the distance between first and last
+    detected points, continuing in the same direction, then loop
+    it downward to 30% of the upward height of detected points.
     """
     if len(points) < 2:
         return points
 
-    p_last = np.array(points[-1], dtype=np.float32)
-    p_prev = np.array(points[-2], dtype=np.float32)
+    p_first = np.array(points[0], dtype=np.float64)
+    p_last = np.array(points[-1], dtype=np.float64)
 
-    direction = p_last - p_prev
-    norm = np.linalg.norm(direction)
-    if norm < 1e-6:
+    # Total distance between first and last detected point
+    total_dist = np.linalg.norm(p_last - p_first)
+    if total_dist < 1:
         return points
 
-    direction = direction / norm
+    # Extension length = 40% of that distance (longer hang time)
+    extend_len = total_dist * 0.70
 
-    # Perpendicular vector
-    perp = np.array([-direction[1], direction[0]], dtype=np.float32)
+    # Direction from the last two points (continuation direction)
+    p_prev = np.array(points[-2], dtype=np.float64)
+    direction = p_last - p_prev
+    dir_norm = np.linalg.norm(direction)
+    if dir_norm < 1e-6:
+        direction = p_last - p_first
+        dir_norm = np.linalg.norm(direction)
+    direction = direction / max(dir_norm, 1e-6)
 
-    # Make a small downward curling arc
+    # Upward height of detected points (in image coords, min y - max y)
+    all_ys = [p[1] for p in points]
+    height_up = max(all_ys) - min(all_ys)  # total vertical span
+    # Loop should come down by 30% of that height
+    drop_amount = height_up * 0.60
+
+    # Build the extension + loop
     loop_points = []
-    for t in np.linspace(0, 1, num_loop_points):
-        angle = t * np.pi * 0.9  # partial arc, not full circle
+    # for i in range(1, num_loop_points + 1):
+    #     t = i / num_loop_points  # 0 -> 1
 
-        forward = direction * (t * loop_radius * 0.8)
-        sideways = perp * (np.sin(angle) * loop_radius * 0.6)
-        downward = np.array([0, (t ** 1.5) * loop_radius * 1.2], dtype=np.float32)
+    #     # Move forward along the direction (extends 20%)
+    #     forward = direction * extend_len * t
 
-        pt = p_last + forward + sideways + downward
-        loop_points.append((int(pt[0]), int(pt[1])))
+    #     # Downward pull: hangs near the top for most of the extension,
+    #     # only dropping in the final portion. t^5 keeps it flat longer.
+    #     drop = np.array([0.0, drop_amount * (t ** 35)])
+
+    #     pt = p_last + forward + drop
+    #     loop_points.append((int(round(pt[0])), int(round(pt[1]))))
 
     return points + loop_points
 
@@ -165,9 +182,9 @@ def main():
         smooth_traj = smooth_points(trajectory_points, window=7)
 
         # Extend forward
-        extended_traj = extend_trajectory(smooth_traj, num_extra=12)
+        extended_traj = extend_trajectory(smooth_traj, num_extra=30)
 
-        final_traj = add_end_loop(extended_traj, loop_radius=20, num_loop_points=30)
+        final_traj = add_end_loop(extended_traj, num_loop_points=50)
 
         # Create overlay for transparency
         overlay = frame.copy()
@@ -179,7 +196,7 @@ def main():
                 [pts],
                 isClosed=False,
                 color=(0, 0, 255),
-                thickness=8,
+                thickness=20,
                 lineType=cv2.LINE_AA,
             )
 
