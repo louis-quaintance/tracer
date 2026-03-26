@@ -62,8 +62,8 @@ def main():
     parser.add_argument("video", help="Path to input video file")
     parser.add_argument("--model", default="best_new_v1.pt")
     parser.add_argument("--conf", type=float, default=0.25)
-    parser.add_argument("--save", "-s", default=None,
-                        help="Optional: also save output to this file")
+    parser.add_argument("--output", "-o", default="realtime_output.mp4",
+                        help="Output video file (default: realtime_output.mp4)")
     args = parser.parse_args()
 
     video_path = Path(args.video)
@@ -85,81 +85,65 @@ def main():
     delay = max(1, int(1000 / fps))  # ms between frames for real-time playback
     print(f"Video: {w}x{h} @ {fps:.1f} fps, {total} frames")
 
-    writer = None
-    if args.save:
-        fourcc = cv2.VideoWriter_fourcc(*"mp4v")
-        writer = cv2.VideoWriter(args.save, fourcc, fps, (w, h))
-
-    cv2.namedWindow("Trace", cv2.WINDOW_NORMAL)
-    cv2.resizeWindow("Trace", min(w, 1280), min(h, 720))
-
+    # --- Pass 1: detect all frames (no drawing, no display) ---
+    print("Pass 1: detecting...")
+    frames = []
     trajectory_points = []
+    # per-frame index into trajectory_points: how many points exist after this frame
+    traj_counts = []
     frame_idx = 0
-    paused = False
 
     while True:
-        if not paused:
-            ret, frame = cap.read()
-            if not ret:
-                # Hold on last frame until user quits
-                key = cv2.waitKey(0) & 0xFF
-                if key == ord("q"):
-                    break
-                continue
-            frame_idx += 1
-
-            # --- detection ---
-            results = model(frame, conf=args.conf, verbose=False)
-            best_point = None
-            best_conf = -1.0
-            for result in results:
-                boxes = result.boxes
-                for i in range(len(boxes)):
-                    bx1, by1, bx2, by2 = map(int, boxes.xyxy[i])
-                    cx = (bx1 + bx2) // 2
-                    cy = (by1 + by2) // 2
-                    conf = float(boxes.conf[i])
-                    if conf > best_conf:
-                        best_conf = conf
-                        best_point = (cx, cy)
-
-            if best_point is not None:
-                trajectory_points.append(best_point)
-
-            # --- trajectory processing ---
-            smooth_traj = smooth_points(trajectory_points)
-            final_traj = extend_trajectory(smooth_traj)
-
-            # --- draw ---
-            display = draw_trajectory(frame, final_traj)
-
-            # Draw current detection dot
-            if best_point is not None:
-                cv2.circle(display, best_point, 8, (0, 255, 0), -1,
-                           lineType=cv2.LINE_AA)
-
-            # HUD
-            cv2.putText(display, f"Frame {frame_idx}/{total}  Detections: {len(trajectory_points)}",
-                        (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 2,
-                        cv2.LINE_AA)
-
-            if writer:
-                writer.write(display)
-
-            cv2.imshow("Trace", display)
-
-        key = cv2.waitKey(delay) & 0xFF
-        if key == ord("q"):
+        ret, frame = cap.read()
+        if not ret:
             break
-        elif key == ord(" "):
-            paused = not paused
+        frame_idx += 1
+        frames.append(frame)
+
+        results = model(frame, conf=args.conf, verbose=False)
+        best_point = None
+        best_conf = -1.0
+        for result in results:
+            boxes = result.boxes
+            for i in range(len(boxes)):
+                bx1, by1, bx2, by2 = map(int, boxes.xyxy[i])
+                cx = (bx1 + bx2) // 2
+                cy = (by1 + by2) // 2
+                conf = float(boxes.conf[i])
+                if conf > best_conf:
+                    best_conf = conf
+                    best_point = (cx, cy)
+
+        if best_point is not None:
+            trajectory_points.append(best_point)
+        traj_counts.append(len(trajectory_points))
+
+        if frame_idx % 50 == 0:
+            print(f"  Frame {frame_idx}/{total} — {len(trajectory_points)} detections")
 
     cap.release()
-    if writer:
-        writer.release()
-        print(f"Saved to {args.save}")
-    cv2.destroyAllWindows()
-    print(f"Done — {len(trajectory_points)} detections across {frame_idx} frames")
+    print(f"Detection done: {len(trajectory_points)} detections across {frame_idx} frames")
+
+    # Pre-compute the full smoothed + extended trajectory once
+    smooth_traj = smooth_points(trajectory_points)
+    full_traj = extend_trajectory(smooth_traj)
+
+    # --- Pass 2: render trajectory onto frames and write video ---
+    print("Pass 2: rendering output...")
+    fourcc = cv2.VideoWriter_fourcc(*"mp4v")
+    writer = cv2.VideoWriter(args.output, fourcc, fps, (w, h))
+
+    for i, frame in enumerate(frames):
+        # Draw trajectory up to this frame's detection count
+        count = traj_counts[i]
+        if count >= 2:
+            partial = smooth_points(trajectory_points[:count])
+            partial = extend_trajectory(partial)
+            frame = draw_trajectory(frame, partial)
+        writer.write(frame)
+
+    writer.release()
+    print(f"Done! Output: {args.output}")
 
 
 if __name__ == "__main__":
